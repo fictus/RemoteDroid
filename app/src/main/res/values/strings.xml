@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">RemoteDroid</string>
+    <string name="a11y_desc">Lets RemoteDroid perform taps, swipes, typing and navigation on this phone when you control it from your computer. It does not read or store screen content.</string>
+</resources>
