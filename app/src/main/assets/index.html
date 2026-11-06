@@ -24,7 +24,8 @@
   #bar input { width: 220px; padding: 8px 10px; font-size: 14px; }
   #model { color: var(--muted); }
   #stage { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; padding: 12px; }
-  canvas { max-width: 100%; max-height: 100%; background: #000; border-radius: 10px; touch-action: none; cursor: crosshair; outline: none; box-shadow: 0 8px 30px rgba(0,0,0,.5); }
+  video { max-width: 100%; max-height: 100%; background: #000; border-radius: 10px; touch-action: none; cursor: crosshair; outline: none; box-shadow: 0 8px 30px rgba(0,0,0,.5); }
+  #banner { display:none; background:#3a2d12; color:#ffd479; padding:8px 12px; text-align:center; }
   #toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: #2a1f1f; color: var(--bad); padding: 8px 14px; border-radius: 8px; display: none; }
 </style>
 </head>
@@ -32,7 +33,7 @@
 <div id="login">
   <h1>RemoteDroid</h1>
   <p>Enter the PIN shown on your phone</p>
-  <input id="pin" type="password" inputmode="numeric" maxlength="6" placeholder="000000" autofocus>
+  <input id="pin" type="password" inputmode="numeric" maxlength="8" placeholder="PIN" autofocus>
   <button id="connect">Connect</button>
   <div id="err"></div>
 </div>
@@ -46,35 +47,40 @@
     <button class="ghost" data-key="quicksettings">Quick settings</button>
     <button class="ghost" data-key="screenshot">Screenshot</button>
     <button class="ghost" id="wake">Wake</button>
+    <button id="resume" style="display:none">Resume capture</button>
     <button class="ghost" data-key="lock">Lock</button>
     <span class="sp"></span>
     <input id="txt" type="text" placeholder="Type text, press Enter to send">
     <button id="sendtxt">Send</button>
     <span id="model"></span>
   </div>
-  <div id="stage"><canvas id="screen" tabindex="0"></canvas></div>
+  <div id="banner">Phone screen is locked, so Android paused screen capture. Unlock the phone and approve the prompt (or press Resume capture). The connection stays up.</div>
+  <div id="stage"><video id="screen" tabindex="0" autoplay muted playsinline></video></div>
 </div>
 <div id="toast"></div>
 
 <script>
 const $ = id => document.getElementById(id);
-const canvas = $('screen'), ctx = canvas.getContext('2d');
-let ws = null, authed = false;
+const video = $('screen');
+let ws = null, pc = null, dc = null, authed = false, remoteSet = false, queued = [];
 
 function toast(msg) {
   const t = $('toast'); t.textContent = msg; t.style.display = 'block';
   clearTimeout(toast.t); toast.t = setTimeout(() => t.style.display = 'none', 3500);
 }
-function send(o) { if (ws && ws.readyState === 1 && authed) ws.send(JSON.stringify(o)); }
+function wsSend(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
+// Input goes over the WebRTC data channel when open, else falls back to the WebSocket.
+function send(o) {
+  if (!authed) return;
+  if (dc && dc.readyState === 'open') dc.send(JSON.stringify(o)); else wsSend(o);
+}
 
 function connect() {
   $('err').textContent = '';
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}/ws`);
-  ws.binaryType = 'blob';
-  ws.onopen = () => ws.send(JSON.stringify({ type: 'auth', pin: $('pin').value.trim() }));
-  ws.onmessage = e => {
-    if (typeof e.data !== 'string') return draw(e.data);
+  ws.onopen = () => wsSend({ type: 'auth', pin: $('pin').value.trim() });
+  ws.onmessage = async e => {
     const m = JSON.parse(e.data);
     if (m.type === 'auth') {
       if (m.ok) {
@@ -82,15 +88,30 @@ function connect() {
         $('login').style.display = 'none';
         $('app').style.display = 'flex';
         $('model').textContent = m.model || '';
-        canvas.focus();
+        video.focus();
+        startRtc();
       } else {
         $('err').textContent = m.msg || 'Authentication failed';
       }
+    } else if (m.type === 'answer') {
+      await pc.setRemoteDescription({ type: 'answer', sdp: m.sdp });
+      remoteSet = true;
+      for (const c of queued) pc.addIceCandidate(c).catch(() => {});
+      queued = [];
+    } else if (m.type === 'candidate') {
+      const c = { candidate: m.candidate, sdpMid: m.sdpMid, sdpMLineIndex: m.sdpMLineIndex };
+      if (remoteSet) pc.addIceCandidate(c).catch(() => {}); else queued.push(c);
+    } else if (m.type === 'status') {
+      const paused = !m.capturing;
+      $('banner').style.display = paused ? 'block' : 'none';
+      $('resume').style.display = paused ? '' : 'none';
+      if (!paused) send({ type: 'refresh' });
     } else if (m.type === 'error') {
       toast(m.msg);
     }
   };
   ws.onclose = () => {
+    stopRtc();
     if (authed) {
       authed = false;
       $('app').style.display = 'none';
@@ -104,41 +125,53 @@ function connect() {
 $('connect').onclick = connect;
 $('pin').addEventListener('keydown', e => { if (e.key === 'Enter') connect(); });
 
-// ---- Rendering (always show the newest frame) ----
-let pending = null, drawing = false;
-async function draw(blob) {
-  pending = blob;
-  if (drawing) return;
-  drawing = true;
-  while (pending) {
-    const b = pending; pending = null;
-    try {
-      const bmp = await createImageBitmap(b);
-      if (canvas.width !== bmp.width || canvas.height !== bmp.height) {
-        canvas.width = bmp.width; canvas.height = bmp.height;
-      }
-      ctx.drawImage(bmp, 0, 0);
-      bmp.close();
-    } catch (_) {}
-  }
-  drawing = false;
+// ---- WebRTC: phone sends the screen as a video track; we receive only ----
+async function startRtc() {
+  stopRtc();
+  pc = new RTCPeerConnection({ iceServers: [] }); // same Wi-Fi: host candidates are enough
+  pc.addTransceiver('video', { direction: 'recvonly' });
+  dc = pc.createDataChannel('ctl', { ordered: true });
+  pc.ontrack = e => {
+    // Ask the browser for the lowest possible playout buffering.
+    try { e.receiver.playoutDelayHint = 0; } catch (_) {}
+    try { e.receiver.jitterBufferTarget = 0; } catch (_) {}
+    video.srcObject = e.streams[0] || new MediaStream([e.track]);
+    video.play().catch(() => {});
+  };
+  pc.onicecandidate = e => {
+    if (e.candidate) wsSend({ type: 'candidate', candidate: e.candidate.candidate,
+      sdpMid: e.candidate.sdpMid, sdpMLineIndex: e.candidate.sdpMLineIndex });
+  };
+  pc.onconnectionstatechange = () => {
+    if (pc && pc.connectionState === 'failed') toast('Video connection failed. Reload and reconnect.');
+  };
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  wsSend({ type: 'offer', sdp: offer.sdp });
 }
+function stopRtc() {
+  remoteSet = false; queued = [];
+  if (dc) { try { dc.close(); } catch (_) {} dc = null; }
+  if (pc) { try { pc.close(); } catch (_) {} pc = null; }
+  video.srcObject = null;
+}
+$('resume').onclick = () => send({ type: 'resume' });
 
 // ---- Pointer -> tap / long-press / swipe ----
 function norm(e) {
-  const r = canvas.getBoundingClientRect();
+  const r = video.getBoundingClientRect();
   return {
     x: Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)),
     y: Math.min(1, Math.max(0, (e.clientY - r.top) / r.height)),
   };
 }
 let down = null;
-canvas.addEventListener('pointerdown', e => {
-  canvas.setPointerCapture(e.pointerId);
-  canvas.focus();
+video.addEventListener('pointerdown', e => {
+  video.setPointerCapture(e.pointerId);
+  video.focus();
   down = { p: norm(e), px: e.clientX, py: e.clientY, t: performance.now() };
 });
-canvas.addEventListener('pointerup', e => {
+video.addEventListener('pointerup', e => {
   if (!down) return;
   const up = norm(e), dt = performance.now() - down.t;
   const moved = Math.hypot(e.clientX - down.px, e.clientY - down.py);
@@ -150,11 +183,11 @@ canvas.addEventListener('pointerup', e => {
   }
   down = null;
 });
-canvas.addEventListener('pointercancel', () => down = null);
-canvas.addEventListener('contextmenu', e => { e.preventDefault(); send({ type: 'key', key: 'back' }); });
+video.addEventListener('pointercancel', () => down = null);
+video.addEventListener('contextmenu', e => { e.preventDefault(); send({ type: 'key', key: 'back' }); });
 
 let lastWheel = 0;
-canvas.addEventListener('wheel', e => {
+video.addEventListener('wheel', e => {
   e.preventDefault();
   const now = performance.now();
   if (now - lastWheel < 250) return;

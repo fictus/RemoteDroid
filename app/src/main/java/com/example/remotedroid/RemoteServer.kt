@@ -2,6 +2,7 @@ package com.example.remotedroid
 
 import android.content.Context
 import android.os.Build
+import android.os.PowerManager
 import fi.iki.elonen.NanoHTTPD
 import fi.iki.elonen.NanoWSD
 import org.json.JSONObject
@@ -11,27 +12,31 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Serves the web client (assets/index.html) over HTTP and the screen/control
- * channel over a WebSocket on the same port.
+ * Serves the web client (assets/index.html) over HTTP and WebRTC signalling over a
+ * WebSocket on the same port. Video and input travel over WebRTC ([WebRtcHost]).
  *
  * Auth: the first WebSocket message must be {"type":"auth","pin":"123456"}.
  * Five wrong PINs from one IP locks that IP out for a minute.
+ *
+ * This server is deliberately independent of the screen-capture session: it keeps
+ * running when Android ends the MediaProjection (e.g. on screen lock).
  */
 class RemoteServer(
     private val context: Context,
     port: Int,
-    private val pin: String,
-    private val lastFrame: () -> ByteArray?,
+    private val pin: () -> String,
+    private val host: WebRtcHost,
     private val onClientsChanged: (Int) -> Unit,
+    private val onResumeRequested: () -> Unit,
 ) : NanoWSD(port) {
 
     private val clients = CopyOnWriteArrayList<Socket>()
-    private val sendExecutor = Executors.newSingleThreadExecutor()
     private val timer = Executors.newSingleThreadScheduledExecutor()
-    private val busy = AtomicBoolean(false)
+
+    @Volatile
+    private var capturing = false
 
     private class Failures(var count: Int = 0, var lockedUntil: Long = 0)
     private val failures = ConcurrentHashMap<String, Failures>()
@@ -61,27 +66,18 @@ class RemoteServer(
     override fun openWebSocket(handshake: NanoHTTPD.IHTTPSession): NanoWSD.WebSocket =
         Socket(handshake)
 
-    /** Push a JPEG frame to all authenticated clients; drops frames if the network is slow. */
-    fun broadcastFrame(frame: ByteArray) {
-        if (clients.isEmpty()) return
-        if (!busy.compareAndSet(false, true)) return
-        sendExecutor.execute {
-            try {
-                for (c in clients) {
-                    try {
-                        c.send(frame)
-                    } catch (_: IOException) {
-                        if (clients.remove(c)) onClientsChanged(clients.size)
-                    }
-                }
-            } finally {
-                busy.set(false)
-            }
-        }
+    /** Tell every viewer whether the screen is currently being captured. */
+    fun setCapturing(value: Boolean) {
+        capturing = value
+        val msg = statusJson()
+        for (c in clients) c.sendJson(msg)
     }
+
+    private fun statusJson() = JSONObject().put("type", "status").put("capturing", capturing)
 
     override fun stop() {
         for (c in clients) {
+            c.shutdown()
             try {
                 c.close(NanoWSD.WebSocketFrame.CloseCode.GoingAway, "Server stopped", false)
             } catch (_: Exception) {
@@ -89,7 +85,6 @@ class RemoteServer(
         }
         clients.clear()
         super.stop()
-        sendExecutor.shutdownNow()
         timer.shutdownNow()
     }
 
@@ -97,12 +92,18 @@ class RemoteServer(
         @Volatile
         var authed = false
         private val ip = handshake.remoteIpAddress ?: "unknown"
+        private var peer: WebRtcHost.Peer? = null
 
-        private fun reply(obj: JSONObject) {
+        fun sendJson(obj: JSONObject) {
             try {
                 send(obj.toString())
-            } catch (_: IOException) {
+            } catch (_: Exception) {
             }
+        }
+
+        fun shutdown() {
+            peer?.close()
+            peer = null
         }
 
         private fun closeQuietly(reason: String) {
@@ -120,6 +121,7 @@ class RemoteServer(
         override fun onClose(
             code: NanoWSD.WebSocketFrame.CloseCode?, reason: String?, initiatedByRemote: Boolean
         ) {
+            shutdown()
             if (clients.remove(this)) onClientsChanged(clients.size)
         }
 
@@ -135,9 +137,30 @@ class RemoteServer(
                 return
             }
 
+            when (json.optString("type")) {
+                "offer" -> {
+                    peer?.close()
+                    peer = host.newPeer(signal = ::sendJson, onControl = ::control)
+                    peer?.handleOffer(json.optString("sdp"))
+                }
+                "candidate" -> peer?.addCandidate(
+                    json.optString("sdpMid").ifEmpty { null },
+                    json.optInt("sdpMLineIndex"),
+                    json.optString("candidate")
+                )
+                else -> control(json)
+            }
+        }
+
+        /** Input / commands from the browser (data channel, or WebSocket as a fallback). */
+        private fun control(json: JSONObject) {
+            when (json.optString("type")) {
+                "resume" -> { onResumeRequested(); return }
+                "refresh" -> { host.requestFrame(); return }
+            }
             val svc = InputAccessibilityService.instance
             if (svc == null) {
-                reply(
+                sendJson(
                     JSONObject().put("type", "error")
                         .put("msg", "Accessibility service is off on the phone, so control is disabled.")
                 )
@@ -150,20 +173,20 @@ class RemoteServer(
             val now = System.currentTimeMillis()
             val f = failures.getOrPut(ip) { Failures() }
             if (f.lockedUntil > now) {
-                reply(JSONObject().put("type", "auth").put("ok", false).put("msg", "Too many attempts. Try again in a minute."))
+                sendJson(JSONObject().put("type", "auth").put("ok", false).put("msg", "Too many attempts. Try again in a minute."))
                 closeQuietly("Locked out")
                 return
             }
             val given = json.optString("pin")
             val ok = json.optString("type") == "auth" &&
-                MessageDigest.isEqual(pin.toByteArray(), given.toByteArray())
+                MessageDigest.isEqual(pin().toByteArray(), given.toByteArray())
             if (!ok) {
                 f.count++
                 if (f.count >= 5) {
                     f.lockedUntil = now + 60_000
                     f.count = 0
                 }
-                reply(JSONObject().put("type", "auth").put("ok", false).put("msg", "Wrong PIN"))
+                sendJson(JSONObject().put("type", "auth").put("ok", false).put("msg", "Wrong PIN"))
                 closeQuietly("Bad PIN")
                 return
             }
@@ -171,12 +194,13 @@ class RemoteServer(
             authed = true
             clients.add(this)
             onClientsChanged(clients.size)
-            reply(JSONObject().put("type", "auth").put("ok", true).put("model", Build.MODEL))
-            lastFrame()?.let {
-                try {
-                    send(it)
-                } catch (_: IOException) {
-                }
+            sendJson(JSONObject().put("type", "auth").put("ok", true).put("model", Build.MODEL))
+            sendJson(statusJson())
+
+            // Someone is connecting: if the phone's screen is off, turn it on.
+            val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+            if (!pm.isInteractive) {
+                InputAccessibilityService.instance?.handle(JSONObject().put("type", "wake"))
             }
         }
 
