@@ -1,42 +1,38 @@
-   name: Release APK
-   on:
-     push:
-       tags: ['v*']
+name: Release APK
+on:
+  push:
+    tags: ['v*']
 
-   permissions:
-     contents: write
+permissions:
+  contents: write
 
-   jobs:
-     build:
-       runs-on: ubuntu-latest
-       steps:
-         - uses: actions/checkout@v4
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-         - uses: actions/setup-dotnet@v4
-           with:
-             dotnet-version: 9.0.x   # match your project's target
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
 
-         - run: dotnet workload install maui-android
+      - uses: gradle/actions/setup-gradle@v4
 
-         - name: Decode keystore
-           run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > release.keystore
+      - name: Decode keystore
+        run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > "$GITHUB_WORKSPACE/release.keystore"
 
-         - name: Publish APK
-           env:
-             KEY_PASS: ${{ secrets.KEY_PASS }}
-             STORE_PASS: ${{ secrets.STORE_PASS }}
-           run: >
-             dotnet publish RemoteDroid/RemoteDroid.csproj
-             -f net9.0-android -c Release
-             -p:AndroidPackageFormat=apk
-             -p:AndroidKeyStore=true
-             -p:AndroidSigningKeyStore=${{ github.workspace }}/release.keystore
-             -p:AndroidSigningKeyAlias=${{ secrets.KEY_ALIAS }}
-             -p:AndroidSigningKeyPass=env:KEY_PASS
-             -p:AndroidSigningStorePass=env:STORE_PASS
-             -o out
+      - name: Build release APK
+        env:
+          KEYSTORE_PATH: ${{ github.workspace }}/release.keystore
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.KEY_PASS }}
+          STORE_PASS: ${{ secrets.STORE_PASS }}
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease
 
-         - uses: softprops/action-gh-release@v2
-           with:
-             files: out/*-Signed.apk
-             generate_release_notes: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: app/build/outputs/apk/release/*.apk
+          generate_release_notes: true
